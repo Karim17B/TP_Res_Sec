@@ -6,6 +6,12 @@ POP3_PORT="${POP3_PORT:-110}"
 TELNET_PORT="${TELNET_PORT:-23}"
 RELAY_NETS="${RELAY_NETS:-10.99.0.0/24}"
 
+# Point 4.a du sujet : "desactiver l'un des trois serveurs, au choix".
+# Mettre la variable a 0 dans docker-compose.yml suffit.
+ENABLE_SMTP="${ENABLE_SMTP:-1}"
+ENABLE_POP3="${ENABLE_POP3:-1}"
+ENABLE_TELNET="${ENABLE_TELNET:-1}"
+
 DOVECOT_LOG=/var/log/dovecot.log
 
 # Aligne le reseau de relais sur le plan d'adressage defini dans .env.
@@ -44,46 +50,66 @@ TAIL_PID=$!
 # n'etait jamais atteinte et Dovecot n'etait jamais demarre. Le port 25
 # repondait, le port 110 refusait la connexion, et le conteneur restait Up.
 # On demande donc explicitement le premier plan et on gere la tache de fond.
-exim4 -bdf -oX "${SMTP_PORT}" -q15m &
-EXIM_PID=$!
+PIDS=()
+if [ "${ENABLE_SMTP}" = "1" ]; then
+  exim4 -bdf -oX "${SMTP_PORT}" -q15m &
+  EXIM_PID=$!
+  PIDS+=("${EXIM_PID}")
+else
+  EXIM_PID=""
+fi
 
 # La sortie du demarrage est capturee dans le meme fichier. Un message fatal
 # ecrit avant l'ouverture du journal atterrit donc quand meme dans les logs.
-dovecot -F >> "${DOVECOT_LOG}" 2>&1 &
-DOVECOT_PID=$!
+if [ "${ENABLE_POP3}" = "1" ]; then
+  dovecot -F >> "${DOVECOT_LOG}" 2>&1 &
+  DOVECOT_PID=$!
+  PIDS+=("${DOVECOT_PID}")
+else
+  DOVECOT_PID=""
+fi
 
 # --- TELNET (§2) : demarrage du superdaemon inetd ---------------------------
 # inetd ecoute le port du service 'telnet' (23 par defaut, resolu via
 # /etc/services) et lance in.telnetd a chaque connexion entrante. Pour le §4
 # (ports arbitraires) on reecrit la ligne de /etc/services si TELNET_PORT != 23.
 # inetd se detache tout seul en tache de fond, il ne bloque donc pas ce script.
-if [ "${TELNET_PORT}" != "23" ]; then
-  sed -i -E "s#^telnet[[:space:]]+23/tcp#telnet\t\t${TELNET_PORT}/tcp#" /etc/services
+if [ "${ENABLE_TELNET}" = "1" ]; then
+  if [ "${TELNET_PORT}" != "23" ]; then
+    sed -i -E "s#^telnet[[:space:]]+23/tcp#telnet\t\t${TELNET_PORT}/tcp#" /etc/services
+  fi
+  /etc/init.d/openbsd-inetd restart >/dev/null 2>&1 || /etc/init.d/openbsd-inetd start
+else
+  /etc/init.d/openbsd-inetd stop >/dev/null 2>&1 || true
 fi
-/etc/init.d/openbsd-inetd restart >/dev/null 2>&1 || /etc/init.d/openbsd-inetd start
 
 # Arret propre, sinon Docker attend dix secondes avant le SIGKILL.
-trap 'kill -TERM "${EXIM_PID}" "${DOVECOT_PID}" "${TAIL_PID}" 2>/dev/null; exit 0' TERM INT
+trap 'kill -TERM ${PIDS[@]+"${PIDS[@]}"} "${TAIL_PID}" 2>/dev/null; exit 0' TERM INT
+
+if [ ${#PIDS[@]} -eq 0 ] && [ "${ENABLE_TELNET}" != "1" ]; then
+  echo "ERREUR : les trois services sont desactives, rien a faire." >&2
+  exit 1
+fi
 
 # Attente que les deux ecouteurs soient reellement ouverts.
 port_ouvert() { ss -ltn "sport = :$1" | grep -q LISTEN; }
 
-SMTP_OK=0
-POP3_OK=0
+# Un service desactive est considere OK, il n'a pas a ecouter.
+SMTP_OK=$([ "${ENABLE_SMTP}"   = "1" ] && echo 0 || echo 1)
+POP3_OK=$([ "${ENABLE_POP3}"   = "1" ] && echo 0 || echo 1)
+TELNET_OK=$([ "${ENABLE_TELNET}" = "1" ] && echo 0 || echo 1)
 for _ in $(seq 1 15); do
-  port_ouvert "${SMTP_PORT}" && SMTP_OK=1
-  port_ouvert "${POP3_PORT}" && POP3_OK=1
-  [ "${SMTP_OK}" -eq 1 ] && [ "${POP3_OK}" -eq 1 ] && break
-  if ! kill -0 "${EXIM_PID}" 2>/dev/null || ! kill -0 "${DOVECOT_PID}" 2>/dev/null; then
-    break
-  fi
+  [ "${ENABLE_SMTP}"   = "1" ] && port_ouvert "${SMTP_PORT}"   && SMTP_OK=1
+  [ "${ENABLE_POP3}"   = "1" ] && port_ouvert "${POP3_PORT}"   && POP3_OK=1
+  [ "${ENABLE_TELNET}" = "1" ] && port_ouvert "${TELNET_PORT}" && TELNET_OK=1
+  [ "${SMTP_OK}" -eq 1 ] && [ "${POP3_OK}" -eq 1 ] && [ "${TELNET_OK}" -eq 1 ] && break
   sleep 1
 done
 
 echo "-----------------------------------------------"
-echo "SMTP (exim4)    : port ${SMTP_PORT}"
-echo "POP3 (dovecot)  : port ${POP3_PORT}"
-echo "TELNET (inetd)  : port ${TELNET_PORT}"
+echo "SMTP (exim4)    : $([ "${ENABLE_SMTP}"   = "1" ] && echo "port ${SMTP_PORT}"   || echo "DESACTIVE")"
+echo "POP3 (dovecot)  : $([ "${ENABLE_POP3}"   = "1" ] && echo "port ${POP3_PORT}"   || echo "DESACTIVE")"
+echo "TELNET (inetd)  : $([ "${ENABLE_TELNET}" = "1" ] && echo "port ${TELNET_PORT}" || echo "DESACTIVE")"
 echo "Relais autorise : ${RELAY_NETS}"
 echo "Comptes mail    : alice/alice et bob/bob"
 echo "Compte telnet   : tptelnet/tptelnet123"
@@ -91,11 +117,12 @@ echo "Ports en ecoute :"
 ss -ltn | tail -n +2
 echo "-----------------------------------------------"
 
-if [ "${SMTP_OK}" -eq 0 ] || [ "${POP3_OK}" -eq 0 ]; then
+if [ "${SMTP_OK}" -eq 0 ] || [ "${POP3_OK}" -eq 0 ] || [ "${TELNET_OK}" -eq 0 ]; then
   {
     echo "==========================================================="
     [ "${SMTP_OK}" -eq 0 ] && echo "ERREUR : rien n'ecoute sur le port SMTP ${SMTP_PORT}."
     [ "${POP3_OK}" -eq 0 ] && echo "ERREUR : rien n'ecoute sur le port POP3 ${POP3_PORT}."
+    [ "${TELNET_OK}" -eq 0 ] && echo "ERREUR : rien n'ecoute sur le port TELNET ${TELNET_PORT}."
     echo "--- journal dovecot ---"
     cat "${DOVECOT_LOG}"
     echo "--- journal exim4 ---"
@@ -111,10 +138,15 @@ if [ "${SMTP_OK}" -eq 0 ] || [ "${POP3_OK}" -eq 0 ]; then
 fi
 
 # Si l'un des deux demons meurt, le conteneur meurt avec lui, avec son code.
-wait -n "${EXIM_PID}" "${DOVECOT_PID}"
+if [ ${#PIDS[@]} -eq 0 ]; then
+  # Seul telnet tourne, et inetd est detache : on garde le conteneur en vie.
+  wait "${TAIL_PID}"
+  exit 0
+fi
+wait -n "${PIDS[@]}"
 CODE=$?
-kill -0 "${EXIM_PID}"    2>/dev/null || echo "exim4 s'est arrete avec le code ${CODE}." >&2
-kill -0 "${DOVECOT_PID}" 2>/dev/null || echo "Dovecot s'est arrete avec le code ${CODE}." >&2
+[ -n "${EXIM_PID}" ]    && ! kill -0 "${EXIM_PID}"    2>/dev/null && echo "exim4 s'est arrete avec le code ${CODE}." >&2
+[ -n "${DOVECOT_PID}" ] && ! kill -0 "${DOVECOT_PID}" 2>/dev/null && echo "Dovecot s'est arrete avec le code ${CODE}." >&2
 cat "${DOVECOT_LOG}" >&2
-kill -TERM "${EXIM_PID}" "${DOVECOT_PID}" "${TAIL_PID}" 2>/dev/null
+kill -TERM ${PIDS[@]+"${PIDS[@]}"} "${TAIL_PID}" 2>/dev/null
 exit "${CODE}"

@@ -45,6 +45,11 @@ ENV SMTP_PORT=25
 ENV POP3_PORT=110
 ENV TELNET_PORT=23
 
+# Point 4.a : "desactiver l'un des trois serveurs, au choix".
+ENV ENABLE_SMTP=1
+ENV ENABLE_POP3=1
+ENV ENABLE_TELNET=1
+
 EXPOSE 23 25 110
 
 # Un conteneur "Up" ne prouve pas que les deux services ecoutent.

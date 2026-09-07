@@ -13,6 +13,10 @@ services:
       SMTP_PORT: "25"
       POP3_PORT: "110"
       TELNET_PORT: "23"
+      # Etape 4.a : passer l'un des trois a "0" pour desactiver ce serveur.
+      ENABLE_SMTP: "1"
+      ENABLE_POP3: "1"
+      ENABLE_TELNET: "1"
       # Reseau autorise a relayer, injecte dans la config exim4 au demarrage.
       RELAY_NETS: "${LAN_SUBNET:-10.99.0.0/24}"
     cap_add:
@@ -42,6 +46,12 @@ services:
     build: ./attaquant
     container_name: tp1-attaquant
     hostname: attaquant
+    # privileged, et pas seulement cap_add : Docker monte /proc/sys en lecture
+    # seule tant que le conteneur n'est pas privilegie. ettercap ecrit dans
+    # /proc/sys/net/ipv6/conf/all/forwarding au demarrage et s'arrete sinon sur
+    # "ERROR : 30, Read-only file system". Le proxy_arp du point 6.d a besoin
+    # de la meme chose.
+    privileged: true
     cap_add:
       - NET_ADMIN
       - NET_RAW
